@@ -1,0 +1,462 @@
+#!/usr/bin/env python3
+"""
+Growing particle lily  (pygame + numpy)
+
+A stem and leaves grow out of a purple mound, a pink bud rises and slowly
+opens into a six-petal lily with orange stamens while faint dashed circles
+fade in behind it.  Everything is drawn from stippled particles with a glow.
+
+    pip install pygame-ce numpy        (pygame also works; Pillow only for --shot/--record)
+    python lily.py                     run the animation
+    python lily.py --record frames     save PNG frames (30 fps) into ./frames
+    python lily.py --shot 3 7 12 20    save stills at those seconds
+
+Keys:  R = restart   ESC = quit
+"""
+import os
+import sys
+import math
+import argparse
+
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+import numpy as np
+
+# --------------------------------------------------------------------------
+W, H = 720, 900          # canvas
+CX = W / 2
+GY = H - 100             # ground line where the stem starts
+HS = 480.0               # full stem height (px)
+LMAX = 205.0             # full petal length (px)
+TILT = 0.40              # camera looks slightly down on the bloom
+rng = np.random.default_rng(11)
+
+
+def smooth(x, a, b):
+    t = np.clip((np.asarray(x, dtype=np.float32) - a) / (b - a), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def C(r, g, b):
+    return np.array([r, g, b], np.float32)
+
+
+def mix(c0, c1, t):
+    """Blend colour(s) c0 -> c1 by per-particle t (shape N)."""
+    t = np.asarray(t, np.float32)[:, None]
+    return c0 * (1.0 - t) + c1 * t
+
+
+def shape(u):
+    """Petal / leaf outline: 0 at base, widest ~55 %, pointed tip."""
+    return np.sin(np.pi * np.clip(u, 0, 1) ** 0.8) ** 0.9
+
+
+def sample_u(n):
+    """u along the blade, distributed proportionally to local width."""
+    out, have = [], 0
+    while have < n:
+        u = rng.random(n * 2)
+        keep = rng.random(n * 2) < shape(u)
+        out.append(u[keep])
+        have += keep.sum()
+    return np.concatenate(out)[:n]
+
+
+# --------------------------------------------------------------------------
+#  Stem
+# --------------------------------------------------------------------------
+def stem_x(s, a):
+    return CX + (13 * np.sin(s * 2.6) + 3.0 * np.sin(0.9 * a + s * 2.0)) * s
+
+
+def stem_y(s):
+    return GY - s * HS
+
+
+# (attach height, side, length, start angle above horizontal)
+LEAVES = [
+    (0.09, -1, 200, 0.42),
+    (0.13, +1, 190, 0.40),
+    (0.29, -1, 150, 0.55),
+    (0.34, +1, 155, 0.52),
+    (0.50, -1, 100, 0.80),
+    (0.56, +1, 95, 0.80),
+]
+
+
+class Scene:
+    def __init__(self):
+        self.build_background()
+        self.build_stem()
+        self.build_leaves()
+        self.build_ground()
+        self.build_head()
+        self.build_rings()
+
+    # ---------------------------------------------------------------- bg
+    def build_background(self):
+        xs = np.linspace(0, 1, W, dtype=np.float32)[:, None]
+        ys = np.linspace(0, 1, H, dtype=np.float32)[None, :]
+        top = C(4, 6, 15)
+        bot = C(24, 32, 88)
+        f = np.clip((ys - 0.15) / 0.85, 0, 1) ** 1.4
+        bg = top[None, None, :] * (1 - f[..., None]) + bot[None, None, :] * f[..., None]
+        bg = np.broadcast_to(bg, (W, H, 3)).copy()
+        # soft lighter patch low-left, vignette on the sides
+        cxl, cyl = 0.30, 0.92
+        d = ((xs - cxl) ** 2 * 1.2 + (ys - cyl) ** 2)
+        bg += (C(14, 20, 60)[None, None, :]) * np.exp(-d * 6)[..., None]
+        vig = 1.0 - 0.35 * np.abs(xs - 0.5) * 2
+        bg *= vig[..., None]
+        self.bg = bg.astype(np.float32)
+        # stars
+        n = 260
+        self.sx = rng.integers(0, W, n)
+        self.sy = rng.integers(0, int(H * 0.95), n)
+        self.sb = rng.uniform(0.25, 1.0, n).astype(np.float32)
+        self.sp = rng.uniform(0, 6.28, n).astype(np.float32)
+
+    # -------------------------------------------------------------- stem
+    def build_stem(self):
+        n = 9000
+        self.st_s = rng.random(n).astype(np.float32)
+        self.st_a = rng.uniform(-1, 1, n).astype(np.float32)
+        self.st_r = rng.random(n).astype(np.float32)
+
+    def stem_points(self, a, g):
+        m = self.st_s <= g
+        s, ac, r = self.st_s[m], self.st_a[m], self.st_r[m]
+        w = lerp(7.0, 3.8, s)
+        X = stem_x(s, a) + ac * w
+        Y = stem_y(s) + rng.normal(0, 0.4, s.size)
+        e = np.abs(ac)
+        c = mix(C(105, 245, 150), C(30, 175, 100), e ** 1.4)
+        c *= (0.7 + 0.4 * r)[:, None]
+        Z = np.zeros(s.size, np.float32)
+        return X, Y, Z, c, r < 0.35
+
+    # ------------------------------------------------------------ leaves
+    def build_leaves(self):
+        self.lf = []
+        for (s, side, L, ang0) in LEAVES:
+            n = 1900
+            u = sample_u(n).astype(np.float32)
+            v = rng.uniform(-1, 1, n).astype(np.float32)
+            r = rng.random(n).astype(np.float32)
+            self.lf.append((s, side, L, ang0, u, v, r))
+
+    def leaf_points(self, a, g):
+        outs = []
+        M = 40
+        uu = np.linspace(0, 1, M)
+        for i, (s, side, L, ang0, u, v, r) in enumerate(self.lf):
+            lg = float(smooth(g, s, s + 0.30))
+            if lg < 0.02:
+                continue
+            Lk = L * lg
+            ang = ang0 - (ang0 + 0.40) * uu ** 1.2 + 0.035 * math.sin(1.2 * a + i)
+            tx, ty = side * np.cos(ang), -np.sin(ang)
+            px = np.concatenate([[0], np.cumsum(0.5 * (tx[1:] + tx[:-1]))]) * Lk / (M - 1)
+            py = np.concatenate([[0], np.cumsum(0.5 * (ty[1:] + ty[:-1]))]) * Lk / (M - 1)
+            nx, ny = side * ty, -side * tx
+            mx, my = np.interp(u, uu, px), np.interp(u, uu, py)
+            nxu, nyu = np.interp(u, uu, nx), np.interp(u, uu, ny)
+            hw = 0.19 * Lk * shape(u)
+            X = stem_x(s, a) + mx + nxu * v * hw
+            Y = stem_y(s) + my + nyu * v * hw
+            lit = 0.5 + 0.5 * v
+            c = mix(C(40, 175, 95), C(105, 235, 145), np.clip(u * 3, 0, 1))
+            c = mix_arr(c, C(205, 255, 150), (lit ** 2) * 0.85 * smooth(u, 0.1, 0.5))
+            c = mix_arr(c, C(200, 255, 200), (np.abs(v) < 0.04) * 0.45)
+            c *= (0.55 + 0.55 * r)[:, None]
+            Z = np.full(u.size, 1.0, np.float32)
+            outs.append((X, Y, Z, c, r < 0.4))
+        return outs
+
+    # ------------------------------------------------------------ ground
+    def build_ground(self):
+        n = 7000
+        gx = np.clip(CX + rng.normal(0, 150, n), 0, W - 1)
+        h = 62 * np.exp(-((gx - CX) / 140) ** 2) + 10
+        r = rng.random(n)
+        gy = GY + 50 - h * r ** 1.2
+        self.g = (gx.astype(np.float32), gy.astype(np.float32), r.astype(np.float32),
+                  (h * r ** 1.6).astype(np.float32))
+
+    def ground_points(self, g):
+        gx, gy, r, hh = self.g
+        k = float(smooth(g, 0.0, 0.25)) * 0.9 + 0.1
+        c = mix(C(95, 75, 170), C(175, 150, 235), r)
+        c *= (0.10 + 0.90 * r ** 1.5)[:, None] * k
+        Z = np.full(gx.size, -500.0, np.float32)
+        return gx, gy, Z, c, r < 0.25
+
+    # -------------------------------------------------------------- head
+    def build_head(self):
+        NP = 7000
+        self.NP = NP
+        base = np.arange(6) * (math.pi / 3) + 0.25
+        self.phi = base + rng.uniform(-0.08, 0.08, 6)
+        self.thoff = np.array([0.18, -0.10, 0.22, -0.20, 0.08, -0.16], np.float32)
+        self.hu = [sample_u(NP).astype(np.float32) for _ in range(6)]
+        self.hv = [rng.uniform(-1, 1, NP).astype(np.float32) for _ in range(6)]
+        self.hr = [rng.random((4, NP)).astype(np.float32) for _ in range(6)]
+        # stamens
+        self.sphi = np.arange(6) * (math.pi / 3) + 0.9 + rng.uniform(-0.2, 0.2, 6)
+        self.sth = np.array([0.55, 0.40, 0.62, 0.35, 0.50, 0.28])
+        self.slen = np.array([0.92, 0.80, 0.98, 0.70, 0.86, 1.05])
+        self.sf = rng.random((6, 70)).astype(np.float32)
+        self.sa = rng.normal(0, 1, (6, 90, 3)).astype(np.float32)
+        self.sar = rng.random((6, 90)).astype(np.float32)
+
+    def head_points(self, a, ox, oy):
+        vis = float(smooth(a, 1.9, 2.9))
+        if vis <= 0.01:
+            return []
+        Lf = LMAX * (0.07 + 0.93 * float(smooth(a, 2.4, 11.8)) ** 0.8) * vis
+        o = float(smooth(a, 5.6, 13.8))
+        yaw = 0.16 * a + 0.5
+        cyw, syw = math.cos(yaw), math.sin(yaw)
+        ct, st = math.cos(TILT), math.sin(TILT)
+        light = np.array([-0.3, 0.75, 0.6], np.float32)
+        light /= np.linalg.norm(light)
+
+        def xform(x, y, z):
+            x1 = x * cyw + z * syw
+            z1 = -x * syw + z * cyw
+            y2 = y * ct - z1 * st
+            z2 = y * st + z1 * ct
+            return x1, y2, z2
+
+        M = 48
+        uu = np.linspace(0, 1, M)
+        outs = []
+        for k in range(6):
+            phi = self.phi[k]
+            Lk = Lf * (1.0 - 0.08 * (k % 2))
+            thb = lerp(0.10, 1.22, o) + self.thoff[k] * (0.4 + o) + 0.035 * math.sin(1.3 * a + k * 1.7)
+            th = thb + (0.08 + 0.50 * o) * uu ** 1.5
+            d = np.stack([np.sin(th) * math.cos(phi), np.cos(th), np.sin(th) * math.sin(phi)])
+            mid = np.concatenate([np.zeros((3, 1)), np.cumsum(0.5 * (d[:, 1:] + d[:, :-1]), axis=1)], axis=1)
+            mid *= Lk / (M - 1)
+            lat = np.array([-math.sin(phi), 0.0, math.cos(phi)])
+            cr = np.stack([
+                d[1] * lat[2] - d[2] * lat[1],
+                d[2] * lat[0] - d[0] * lat[2],
+                d[0] * lat[1] - d[1] * lat[0],
+            ])
+            nin = -cr / (np.linalg.norm(cr, axis=0) + 1e-9)
+
+            u, v, rr = self.hu[k], self.hv[k], self.hr[k]
+            mx, my, mz = (np.interp(u, uu, mid[i]) for i in range(3))
+            nx, ny, nz = (np.interp(u, uu, nin[i]) for i in range(3))
+            hw = 0.27 * Lk * shape(u) * (0.62 + 0.38 * o)
+            cup = 0.15 + 0.70 * (1 - o)
+            lv = v * hw
+            cv = cup * v * v * hw
+            x = mx + lat[0] * lv + nx * cv
+            y = my + lat[1] * lv + ny * cv
+            z = mz + lat[2] * lv + nz * cv
+            x1, y2, z2 = xform(x, y, z)
+            n1, n2, n3 = xform(nx, ny, nz)
+
+            lit = np.clip(n1 * light[0] + n2 * light[1] + n3 * light[2], 0, 1)
+            dpt = np.clip(0.5 + z2 / (1.4 * LMAX), 0, 1)
+            f = 0.60 * dpt + 0.40 * lit
+            shade = 0.08 + 0.92 * f ** 1.6
+
+            # colour along the petal
+            cream, pink = C(255, 240, 175), C(255, 70, 175)
+            magenta, lilac, tip = C(225, 70, 215), C(190, 110, 245), C(245, 175, 250)
+            co = mix(cream, pink, smooth(u, 0.16, 0.42))
+            co = mix_arr(co, magenta, smooth(u, 0.38, 0.62))
+            co = mix_arr(co, lilac, smooth(u, 0.62, 0.90))
+            co = mix_arr(co, tip, smooth(u, 0.90, 1.0) * 0.6)
+            cc = mix(C(255, 55, 165), C(255, 238, 165), smooth(u, 0.55, 0.80))
+            c = cc * (1 - o) + co * o
+            dark = C(55, 20, 105)
+            sh = shade[:, None]
+            c = dark * (1 - sh) + c * sh
+            # sparkle, veins, rim, grain
+            sp = rr[0] < (0.06 + 0.14 * (1 - shade))
+            c = mix_arr(c, C(255, 225, 250), sp * (0.6 + 0.4 * rr[1]) * (0.4 + 0.6 * shade))
+            vein = (np.abs(v) < 0.035) | (np.abs(np.abs(v) - 0.42) < 0.02)
+            c = mix_arr(c, C(255, 230, 255), vein * 0.40 * shade)
+            c = mix_arr(c, C(255, 170, 240), (np.abs(v) > 0.88) * 0.25 * shade)
+            c *= (0.55 + 0.50 * rr[2])[:, None]
+            outs.append((ox + x1, oy - y2, z2.astype(np.float32), c, rr[3] < 0.45))
+
+        # ---- stamens (appear while the flower opens)
+        so = float(smooth(o, 0.30, 1.0))
+        if so > 0.02:
+            for k in range(6):
+                th, phi = self.sth[k] + 0.1 * math.sin(1.1 * a + k), self.sphi[k]
+                lf = Lf * self.slen[k] * so
+                t = self.sf[k]
+                dirv = np.array([math.sin(th) * math.cos(phi), math.cos(th), math.sin(th) * math.sin(phi)])
+                p = dirv[:, None] * (t * lf)[None, :]
+                p[1] += 0.22 * lf * t * (1 - t)
+                x1, y2, z2 = xform(p[0], p[1] + 0.12 * Lf, p[2])
+                c = np.tile(C(255, 190, 225) * 0.5, (t.size, 1))
+                outs.append((ox + x1, oy - y2, z2.astype(np.float32) + 5, c, np.zeros(t.size, bool)))
+                tip_p = dirv * lf
+                tip_p[1] += 0.0
+                g = self.sa[k] * (0.011 * Lf + 0.8)
+                q = tip_p[:, None] + g.T
+                x1, y2, z2 = xform(q[0], q[1] + 0.12 * Lf, q[2])
+                r = self.sar[k]
+                c = mix(C(255, 120, 20), C(255, 190, 70), r) * (0.75 + 0.4 * r)[:, None] * min(0.85, so * 1.5)
+                outs.append((ox + x1, oy - y2, z2.astype(np.float32) + 8, c, r < 0.6))
+        return outs
+
+    # ------------------------------------------------------------- rings
+    def build_rings(self):
+        # (dx, dy, radius, dashes)
+        self.rings = [
+            (0, -55, 255, 120), (-205, 25, 150, 70), (215, 105, 175, 80),
+            (-35, 215, 240, 100), (160, -210, 110, 60), (-230, -150, 105, 56),
+            (110, 330, 160, 70), (-165, 300, 130, 64), (270, -60, 95, 50),
+            (30, -330, 130, 70), (-300, 190, 120, 60),
+        ]
+        self.rt = [np.linspace(0, 2 * math.pi, int(r[2] * 4.5), dtype=np.float32) for r in self.rings]
+        self.rb = [rng.uniform(0.3, 1.0, t.size).astype(np.float32) for t in self.rt]
+
+    def ring_layer(self, a, out):
+        al = float(smooth(a, 4.5, 11.0)) * 1.0
+        if al < 0.01:
+            return
+        ox, oy = CX + 9, GY - HS
+        grow = 0.55 + 0.45 * float(smooth(a, 3.5, 10.0))
+        for i, (dx, dy, R, kd) in enumerate(self.rings):
+            th = self.rt[i]
+            ph = 0.03 * a * (1 if i % 2 else -1)
+            mask = ((th * kd / (2 * math.pi) + ph) % 1.0) < 0.55
+            t = th[mask]
+            b = self.rb[i][mask] * al * (1.0 if i == 0 else 0.6)
+            r = R * grow
+            x = (ox + dx * grow + r * np.cos(t)).astype(int)
+            y = (oy + dy * grow + r * np.sin(t)).astype(int)
+            ok = (x >= 0) & (x < W) & (y >= 0) & (y < H)
+            col = C(205, 200, 255) * b[ok][:, None]
+            out[x[ok], y[ok]] += col
+
+    # -------------------------------------------------------------- draw
+    def render(self, a):
+        t = a / 2.8
+        g = float(1 - (1 - np.clip(t, 0, 1)) ** 2.2)
+        groups = []
+        groups.append(self.ground_points(g))
+        groups.append(self.stem_points(a, g))
+        groups += self.leaf_points(a, g)
+        if g > 0.9:
+            ox, oy = float(stem_x(g, a)), float(stem_y(g))
+            groups += self.head_points(a, ox, oy)
+
+        X = np.concatenate([p[0] for p in groups]) + rng.normal(0, 0.35, sum(p[0].size for p in groups))
+        Y = np.concatenate([p[1] for p in groups]) + rng.normal(0, 0.35, X.size)
+        Z = np.concatenate([p[2] for p in groups])
+        Cc = np.concatenate([p[3] for p in groups]).astype(np.float32)
+        B = np.concatenate([p[4] for p in groups])
+        xi, yi = np.rint(X).astype(np.int32), np.rint(Y).astype(np.int32)
+        ok = (xi >= 0) & (xi < W - 1) & (yi >= 0) & (yi < H - 1)
+        xi, yi, Z, Cc, B = xi[ok], yi[ok], Z[ok], Cc[ok], B[ok]
+        order = np.argsort(Z, kind="stable")           # far -> near, near wins
+        xi, yi, Cc, B = xi[order], yi[order], Cc[order], B[order]
+
+        layer = np.zeros((W, H, 3), np.float32)
+        layer[xi, yi] = Cc
+        layer[xi[B] + 1, yi[B]] = Cc[B]
+        layer[xi[B], yi[B] + 1] = Cc[B]
+
+        # glow: two wide blurs of the particle layer, added back on top
+        glow = blur(layer, 6) * 0.50 + blur(layer, 20) * 0.95
+
+        out = self.bg + layer + glow
+        self.ring_layer(a, out)
+        tw = 0.6 + 0.4 * np.sin(a * 1.7 + self.sp)
+        out[self.sx, self.sy] += C(190, 200, 255)[None, :] * (self.sb * tw)[:, None]
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+
+_UP = {}
+
+
+def _upmat(n_big, n_small):
+    """Linear-interpolation matrix (n_big x n_small)."""
+    key = (n_big, n_small)
+    if key not in _UP:
+        pos = (np.arange(n_big) + 0.5) * n_small / n_big - 0.5
+        i0 = np.clip(np.floor(pos).astype(int), 0, n_small - 1)
+        i1 = np.clip(i0 + 1, 0, n_small - 1)
+        w = np.clip(pos - i0, 0, 1).astype(np.float32)
+        m = np.zeros((n_big, n_small), np.float32)
+        m[np.arange(n_big), i0] += 1 - w
+        m[np.arange(n_big), i1] += w
+        _UP[key] = m
+    return _UP[key]
+
+
+def blur(img, f):
+    """Cheap wide blur: box-downsample by f, then bilinear upsample."""
+    w, h, _ = img.shape
+    sw, sh = w // f, h // f
+    small = img[: sw * f, : sh * f].reshape(sw, f, sh, f, 3).mean(axis=(1, 3))
+    t = (_upmat(w, sw) @ small.reshape(sw, sh * 3)).reshape(w, sh, 3)
+    t = t.transpose(0, 2, 1) @ _upmat(h, sh).T          # (w, 3, h)
+    return t.transpose(0, 2, 1)
+
+
+def mix_arr(c, target, t):
+    """Blend per-particle colours c (N,3) toward a single colour by t (N)."""
+    t = np.asarray(t, np.float32)[:, None]
+    return c * (1.0 - t) + target[None, :] * t
+
+
+# --------------------------------------------------------------------------
+def save_png(arr, path):
+    from PIL import Image
+    Image.fromarray(np.ascontiguousarray(arr.transpose(1, 0, 2))).save(path)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--record", metavar="DIR", help="write PNG frames to DIR (needs Pillow)")
+    ap.add_argument("--shot", type=float, nargs="+", help="save stills at these seconds (needs Pillow)")
+    ap.add_argument("--seconds", type=float, default=22.0, help="length when recording")
+    args = ap.parse_args()
+
+    scene = Scene()
+
+    if args.shot:
+        for t in args.shot:
+            save_png(scene.render(t), f"shot_{t:05.1f}.png")
+        return
+    if args.record:
+        os.makedirs(args.record, exist_ok=True)
+        for i in range(int(args.seconds * 30)):
+            save_png(scene.render(i / 30.0), os.path.join(args.record, f"f{i:04d}.png"))
+        return
+
+    import pygame
+    pygame.init()
+    screen = pygame.display.set_mode((W, H))
+    pygame.display.set_caption("Lily")
+    clock = pygame.time.Clock()
+    t0 = pygame.time.get_ticks()
+    while True:
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_ESCAPE):
+                return
+            if e.type == pygame.KEYDOWN and e.key == pygame.K_r:
+                t0 = pygame.time.get_ticks()
+        pygame.surfarray.blit_array(screen, scene.render((pygame.time.get_ticks() - t0) / 1000.0))
+        pygame.display.flip()
+        clock.tick(60)
+
+
+if __name__ == "__main__":
+    main()
